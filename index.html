@@ -1389,7 +1389,7 @@ let state=null, nextAction=null, holdTimer=null, selectedPlace=null, selK=null, 
 let hideTimerHandle=null, hideTimerDeadline=null, hideTimerStarted=false, hideTimerExpired=false, hideTimerTurnKey=null, hideTimerManualEnd=false;
 let placementTimerHandle=null;
 let playMode="pass", localPlayer=null, onlineRole=null, roomCode=null, peer=null, conn=null, onlineConnected=false, onlineClosing=false;
-const ONLINE_PREFIX="horror-hunt-v124-";
+const ONLINE_PREFIX="horror-hunt-v136-";
 const PHOTO_PACK_KEY="horrorHuntPhotoPackV1";
 const PHOTO_PACK_SESSION_KEY="horrorHuntPhotoPackSessionV1";
 const PHOTO_LAB_UI_KEY="horrorHuntPhotoLabUIV1";
@@ -1398,6 +1398,34 @@ const BUNDLED_PHOTO_PACK={"version":"1.0","characters":{"desjardin26":"data:imag
 let photoOverrides=loadPhotoOverrides();
 let photoLabMode="characters", photoLabSelected=null, photoLabCandidate="", photoLabCandidateLabel="";
 let peerLibPromise=null;
+let onlineConnectTimer=null, onlineRetryTimer=null, guestRelayAttempted=false;
+const ONLINE_ICE_SERVERS=[
+  {urls:["stun:stun.l.google.com:19302","stun:stun1.l.google.com:19302"]},
+  {
+    urls:[
+      "turn:eu-0.turn.peerjs.com:3478?transport=udp",
+      "turn:us-0.turn.peerjs.com:3478?transport=udp",
+      "turn:eu-0.turn.peerjs.com:3478?transport=tcp",
+      "turn:us-0.turn.peerjs.com:3478?transport=tcp"
+    ],
+    username:"peerjs",
+    credential:"peerjsp"
+  }
+];
+function peerOptions(relayOnly=false){
+  return {
+    debug:1,
+    config:{
+      iceServers:ONLINE_ICE_SERVERS,
+      iceTransportPolicy:relayOnly?"relay":"all",
+      sdpSemantics:"unified-plan"
+    }
+  };
+}
+function clearOnlineTimers(){
+  if(onlineConnectTimer){clearTimeout(onlineConnectTimer);onlineConnectTimer=null;}
+  if(onlineRetryTimer){clearTimeout(onlineRetryTimer);onlineRetryTimer=null;}
+}
 function ensurePeerLibrary(){
   if(typeof window.Peer==="function")return Promise.resolve(true);
   if(peerLibPromise)return peerLibPromise;
@@ -1418,7 +1446,7 @@ const fresh=c=>({...c,maxDef:c.def,currentDef:c.def,visibleDef:c.def,pos:null,mo
 function baseState(){
  const kp=shuffle(killerPool), hp=shuffle(heroPool), vp=shuffle(victimPool);
  return {
-  version:"1.26", mode:playMode, phase:"choose", choicePlayer:0, active:0, turn:1, setupPlayer:0, winner:null, reason:"",
+  version:"1.36", mode:playMode, phase:"choose", choicePlayer:0, active:0, turn:1, setupPlayer:0, winner:null, reason:"",
   truth:[],
   players:[
    {setting:null,killers:kp.slice(0,2).map(fresh),heroes:hp.slice(0,4).map(fresh),victims:vp.slice(0,4).map(fresh),news:[],readNews:0,placementDeadline:null,placementResolved:false,placementCasualties:0},
@@ -1438,7 +1466,7 @@ function makeRoomCode(){const a="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let s="";for(
 function setOnlineSupport(){
   const box=$("#onlineSupport"); if(!box)return;
   if(location.protocol!=="https:" && location.hostname!=="localhost") box.innerHTML="Two-phone mode needs <b>HTTPS</b> and internet access. Host this file on GitHub Pages (or another HTTPS site) before connecting the phones.";
-  else box.innerHTML="Two-phone mode uses a direct WebRTC data connection. Internet is needed to establish the connection; Pass & Play remains independent of it.";
+  else box.innerHTML="Two-phone mode uses WebRTC with automatic TURN relay fallback. Internet is needed to establish the connection; Pass & Play remains independent of it.";
 }
 function showOnlineWait(title,text){
   $("#onlineWaitTitle").textContent=title||"WAITING";
@@ -1447,7 +1475,7 @@ function showOnlineWait(title,text){
   only("#onlineWait");
 }
 function closeOnlineRuntime(){
-  onlineClosing=true;
+  onlineClosing=true; clearOnlineTimers(); guestRelayAttempted=false;
   try{if(conn)conn.close()}catch(_e){}
   try{if(peer)peer.destroy()}catch(_e){}
   conn=null;peer=null;onlineConnected=false;onlineRole=null;roomCode=null;localPlayer=null;onlineClosing=false;
@@ -1481,12 +1509,37 @@ function routeOnlinePacket(packet){
   }
   if(view==="gameover"){displayGameOver();return;}
 }
+function connectionStateText(c){
+  try{
+    const pc=c&&c.peerConnection;
+    if(!pc)return "";
+    return pc.connectionState||pc.iceConnectionState||"";
+  }catch(_e){return "";}
+}
+function watchOnlineConnection(c){
+  setTimeout(()=>{
+    try{
+      const pc=c&&c.peerConnection;if(!pc)return;
+      const update=()=>{
+        if(!isOnline()||onlineConnected||c!==conn)return;
+        const st=pc.connectionState||pc.iceConnectionState||"";
+        const target=onlineRole==="guest"?$("#joinStatus"):$("#hostStatus");
+        if(target && ["checking","connecting","new"].includes(st)) target.textContent=onlineRole==="guest"?"Negotiating secure connection…":"Player 2 found. Negotiating secure connection…";
+      };
+      pc.addEventListener&&pc.addEventListener("connectionstatechange",update);
+      pc.addEventListener&&pc.addEventListener("iceconnectionstatechange",update);
+      update();
+    }catch(_e){}
+  },0);
+}
 function attachOnlineConnection(c){
-  conn=c;
+  conn=c; watchOnlineConnection(c);
   conn.on("open",()=>{
+    if(c!==conn)return;
+    clearOnlineTimers();
     onlineConnected=true;
     if(onlineRole==="guest"){
-      $("#joinStatus").textContent="Connected. Waiting for Player 1…";
+      $("#joinStatus").textContent=guestRelayAttempted?"Connected through relay. Waiting for Player 1…":"Connected. Waiting for Player 1…";
       conn.send({type:"join"});
       showOnlineWait("CONNECTED","Player 1 will choose the setting and begin setup.");
     }else{
@@ -1503,19 +1556,82 @@ function attachOnlineConnection(c){
     }
     if(data.type==="state")routeOnlinePacket(data);
   });
-  conn.on("close",()=>showOnlineDisconnected("The peer connection was closed."));
-  conn.on("error",()=>showOnlineDisconnected("The peer connection encountered an error."));
+  conn.on("close",()=>{
+    if(onlineClosing||c!==conn)return;
+    if(!onlineConnected){
+      if(onlineRole==="guest"&&!guestRelayAttempted){retryGuestThroughRelay("Direct connection failed.");return;}
+      if(onlineRole==="host"){$("#hostStatus").textContent="First connection attempt failed. Waiting for Player 2 to retry through relay…";return;}
+    }
+    showOnlineDisconnected("The peer connection was closed.");
+  });
+  conn.on("error",err=>{
+    if(onlineClosing||c!==conn)return;
+    if(!onlineConnected&&onlineRole==="guest"&&!guestRelayAttempted){retryGuestThroughRelay("Direct connection failed.");return;}
+    if(!onlineConnected&&onlineRole==="host"){$("#hostStatus").textContent=`Connection attempt error${err&&err.type?`: ${err.type}`:""}. Waiting for retry…`;return;}
+    showOnlineDisconnected("The peer connection encountered an error.");
+  });
+}
+function armConnectionTimeout(relayOnly){
+  if(onlineConnectTimer)clearTimeout(onlineConnectTimer);
+  onlineConnectTimer=setTimeout(()=>{
+    if(onlineConnected||onlineRole!=="guest")return;
+    if(!relayOnly&&!guestRelayAttempted){retryGuestThroughRelay("Direct connection timed out.");return;}
+    $("#joinStatus").textContent="Could not connect even through relay. Check that both phones use the newest page, then retry. If needed, switch one phone between Wi‑Fi and mobile data.";
+  },relayOnly?16000:8000);
+}
+function bindPeerRecovery(p,side){
+  p.on("disconnected",()=>{
+    if(onlineClosing||p!==peer)return;
+    const target=side==="guest"?$("#joinStatus"):$("#hostStatus");
+    if(target&&!onlineConnected)target.textContent="Signaling interrupted. Reconnecting…";
+    onlineRetryTimer=setTimeout(()=>{try{if(peer===p&&!p.destroyed&&p.disconnected)p.reconnect();}catch(_e){}},900);
+  });
+}
+function startGuestPeer(relayOnly=false){
+  if(onlineClosing||onlineRole!=="guest")return;
+  try{
+    peer=new Peer(undefined,peerOptions(relayOnly));
+    bindPeerRecovery(peer,"guest");
+    peer.on("open",()=>{
+      if(onlineRole!=="guest")return;
+      $("#joinStatus").textContent=relayOnly?"Connecting through TURN relay…":"Connecting…";
+      const c=peer.connect(ONLINE_PREFIX+roomCode,{serialization:"json",metadata:{role:"guest",build:"1.36",relay:relayOnly}});
+      attachOnlineConnection(c); armConnectionTimeout(relayOnly);
+    });
+    peer.on("error",err=>{
+      if(onlineClosing||onlineRole!=="guest")return;
+      const t=err&&err.type?err.type:"room unavailable";
+      if(!onlineConnected&&!relayOnly&&!guestRelayAttempted&&["network","socket-error","socket-closed"].includes(t)){
+        retryGuestThroughRelay(`Network error: ${t}.`);return;
+      }
+      $("#joinStatus").textContent=`Connection error: ${t}.`;
+    });
+  }catch(_e){$("#joinStatus").textContent="Unable to start the peer connection.";}
+}
+function retryGuestThroughRelay(reason="Direct connection unavailable."){
+  if(onlineRole!=="guest"||onlineConnected||guestRelayAttempted)return;
+  guestRelayAttempted=true; clearOnlineTimers();
+  $("#joinStatus").textContent=`${reason} Retrying through relay…`;
+  try{if(conn)conn.close()}catch(_e){}
+  try{if(peer)peer.destroy()}catch(_e){}
+  conn=null;peer=null;
+  onlineRetryTimer=setTimeout(()=>startGuestPeer(true),500);
 }
 async function createOnlineRoom(){
   $("#hostRoomPanel").classList.remove("hidden");$("#joinRoomPanel").classList.add("hidden");
   $("#hostStatus").textContent="Loading peer connection…";
   try{if(!(await ensurePeerLibrary()))throw new Error("peerjs");}catch(_e){$("#hostStatus").textContent="Could not load the connection library. Check internet access.";return;}
-  closeOnlineRuntime(); playMode="online"; localPlayer=0; onlineRole="host"; state=baseState(); state.mode="online"; roomCode=makeRoomCode();
+  closeOnlineRuntime(); playMode="online"; localPlayer=0; onlineRole="host"; guestRelayAttempted=false; state=baseState(); state.mode="online"; roomCode=makeRoomCode();
   $("#roomCodeDisplay").textContent=roomCode;$("#hostStatus").textContent="Creating secure peer connection…";
   try{
-    peer=new Peer(ONLINE_PREFIX+roomCode,{debug:0});
+    peer=new Peer(ONLINE_PREFIX+roomCode,peerOptions(false));
+    bindPeerRecovery(peer,"host");
     peer.on("open",()=>{$("#hostStatus").textContent="Room ready. Enter this code on Player 2's phone.";});
-    peer.on("connection",c=>{if(conn&&conn.open){try{c.close()}catch(_e){};return;}attachOnlineConnection(c);});
+    peer.on("connection",c=>{
+      if(conn&&conn.open){try{c.close()}catch(_e){};return;}
+      $("#hostStatus").textContent="Player 2 found. Negotiating secure connection…";
+      attachOnlineConnection(c);
+    });
     peer.on("error",err=>{$("#hostStatus").textContent=`Connection error: ${err&&err.type?err.type:"unable to create room"}.`;});
   }catch(_e){$("#hostStatus").textContent="Unable to start the peer connection.";}
 }
@@ -1523,13 +1639,9 @@ async function joinOnlineRoom(code){
   code=cleanRoomCode(code); if(code.length!==6){$("#joinStatus").textContent="Enter the complete six-character code.";return;}
   $("#joinStatus").textContent="Loading peer connection…";
   try{if(!(await ensurePeerLibrary()))throw new Error("peerjs");}catch(_e){$("#joinStatus").textContent="Could not load the connection library. Check internet access.";return;}
-  closeOnlineRuntime(); playMode="online"; localPlayer=1; onlineRole="guest"; roomCode=code; state=null;
+  closeOnlineRuntime(); playMode="online"; localPlayer=1; onlineRole="guest"; roomCode=code; state=null; guestRelayAttempted=false;
   $("#joinStatus").textContent="Connecting…";
-  try{
-    peer=new Peer(undefined,{debug:0});
-    peer.on("open",()=>{const c=peer.connect(ONLINE_PREFIX+roomCode,{reliable:true,serialization:"json"});attachOnlineConnection(c);});
-    peer.on("error",err=>{$("#joinStatus").textContent=`Connection error: ${err&&err.type?err.type:"room unavailable"}.`;});
-  }catch(_e){$("#joinStatus").textContent="Unable to start the peer connection.";}
+  startGuestPeer(false);
 }
 
 function survivors(p){ return [...state.players[p].heroes, ...state.players[p].victims] }
